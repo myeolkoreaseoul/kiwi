@@ -88,7 +88,7 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     }
     state.tasks = tasks;
     state.results = tasks.map(() => ({ status: '대기' }));
-    state.fileName = req.file.originalname;
+    state.fileName = Buffer.from(req.file.originalname, 'latin1').toString('utf8');
     res.json({ ok: true, count: tasks.length, fileName: state.fileName });
   } catch (e) {
     res.status(500).json({ error: e.message });
