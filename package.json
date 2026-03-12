@@ -31,7 +31,7 @@
     "publish": {
       "provider": "github",
       "owner": "myeolkoreaseoul",
-      "repo": "kiwi"
+      "repo": "tessera_addon"
     }
   },
   "dependencies": {
