@@ -1,5 +1,6 @@
 const express = require('express');
 const path = require('path');
+const fs = require('fs');
 const multer = require('multer');
 const XLSX = require('xlsx');
 const { chromium } = require('playwright-core');
@@ -8,17 +9,26 @@ const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '..', 'web')));
 
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
+
+// --- 파일명 sanitize ---
+function sanitizeFilename(name) {
+  return name
+    .replace(/[<>:"/\\|?*]/g, '_')  // Windows 금지 문자
+    .replace(/\.\./g, '_')           // 경로 탈출 방지
+    .replace(/^\.+/, '_')            // 숨김 파일 방지
+    .trim();
+}
 
 // --- 상태 ---
 let state = {
-  downloadDir: '',        // 저장 폴더
-  tasks: [],              // 엑셀에서 파싱한 과제 목록
-  fileName: '',           // 업로드된 파일명
+  downloadDir: '',
+  tasks: [],
+  fileName: '',
   browserConnected: false,
   running: false,
   currentIdx: -1,
-  results: [],            // { idx, status, name }
+  results: [],
 };
 
 let browser = null;
@@ -27,7 +37,6 @@ let cdpSession = null;
 
 // --- API ---
 
-// 상태 조회
 app.get('/api/state', (req, res) => {
   res.json({
     downloadDir: state.downloadDir,
@@ -40,6 +49,7 @@ app.get('/api/state', (req, res) => {
       연구수행기관: t.연구수행기관,
       연구책임자: t.연구책임자,
       status: state.results[i]?.status || '대기',
+      reason: state.results[i]?.reason || '',
     })),
     browserConnected: state.browserConnected,
     running: state.running,
@@ -47,15 +57,17 @@ app.get('/api/state', (req, res) => {
   });
 });
 
-// 저장 폴더 설정
 app.post('/api/set-download-dir', (req, res) => {
   const { dir } = req.body;
   if (!dir) return res.status(400).json({ error: '폴더 경로 필요' });
-  state.downloadDir = dir;
-  res.json({ ok: true, dir });
+  // 경로 정규화
+  const resolved = path.resolve(dir);
+  state.downloadDir = resolved;
+  // 폴더 없으면 생성
+  try { fs.mkdirSync(resolved, { recursive: true }); } catch {}
+  res.json({ ok: true, dir: resolved });
 });
 
-// 엑셀 업로드
 app.post('/api/upload', upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: '파일 없음' });
   try {
@@ -66,7 +78,7 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     const tasks = [];
     for (let i = 1; i < rows.length; i++) {
       const r = rows[i];
-      if (!r[3]) continue; // 과제번호 없으면 스킵
+      if (!r[3]) continue;
       tasks.push({
         사업년도: String(r[2] || ''),
         과제번호: String(r[3] || ''),
@@ -83,27 +95,19 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
   }
 });
 
-// 브라우저 열기
 app.post('/api/browser/launch', async (req, res) => {
   try {
-    // 이미 연결되어 있으면 상태만 반환
     if (browser && browser.isConnected()) {
       state.browserConnected = true;
       return res.json({ ok: true, status: 'already_connected' });
     }
 
-    // 로컬 Chrome 실행 (CDP 9446)
     const execPath = findChromePath();
-    const { execSync } = require('child_process');
-
-    // 이미 9446에서 실행 중인지 확인
     let alreadyRunning = false;
     try {
       const http = require('http');
       await new Promise((resolve, reject) => {
-        const r = http.get('http://127.0.0.1:9446/json/version', { timeout: 2000 }, (resp) => {
-          resolve(true);
-        });
+        const r = http.get('http://127.0.0.1:9446/json/version', { timeout: 2000 }, () => resolve(true));
         r.on('error', () => reject());
         r.on('timeout', () => { r.destroy(); reject(); });
       });
@@ -112,23 +116,36 @@ app.post('/api/browser/launch', async (req, res) => {
 
     if (!alreadyRunning) {
       const dataDir = path.join(require('os').homedir(), 'kiwi-chrome-data');
-      const args = [
-        `--remote-debugging-port=9446`,
+      const { spawn } = require('child_process');
+      const child = spawn(execPath, [
+        '--remote-debugging-port=9446',
         `--user-data-dir=${dataDir}`,
         'https://www.gaia.go.kr/main.do',
-      ];
-      const { spawn } = require('child_process');
-      const child = spawn(execPath, args, { detached: true, stdio: 'ignore' });
+      ], { detached: true, stdio: 'ignore' });
       child.unref();
-      await sleep(3000);
+
+      // 최대 10초 대기
+      for (let i = 0; i < 20; i++) {
+        await sleep(500);
+        try {
+          const http = require('http');
+          await new Promise((resolve, reject) => {
+            const r = http.get('http://127.0.0.1:9446/json/version', { timeout: 1000 }, () => resolve(true));
+            r.on('error', () => reject());
+            r.on('timeout', () => { r.destroy(); reject(); });
+          });
+          break;
+        } catch {}
+      }
     }
 
-    // CDP 연결
     browser = await chromium.connectOverCDP('http://127.0.0.1:9446');
     const contexts = browser.contexts();
+    if (!contexts.length) throw new Error('Chrome 컨텍스트 없음');
     const ctx = contexts[0];
     const pages = ctx.pages();
     page = pages.find(p => /gaia|ezbaro/i.test(p.url())) || pages[0];
+    if (!page) throw new Error('열린 탭 없음');
     page.on('dialog', async d => { try { await d.accept(); } catch {} });
 
     state.browserConnected = true;
@@ -139,14 +156,12 @@ app.post('/api/browser/launch', async (req, res) => {
   }
 });
 
-// 브라우저 상태
 app.get('/api/browser/status', (req, res) => {
-  const connected = browser && browser.isConnected();
+  const connected = !!(browser && browser.isConnected());
   state.browserConnected = connected;
   res.json({ connected, url: page ? page.url() : null });
 });
 
-// 다운로드 시작
 app.post('/api/start', async (req, res) => {
   if (state.running) return res.status(400).json({ error: '이미 실행 중' });
   if (!state.tasks.length) return res.status(400).json({ error: '과제 목록 없음' });
@@ -157,14 +172,12 @@ app.post('/api/start', async (req, res) => {
   state.currentIdx = 0;
   res.json({ ok: true });
 
-  // 비동기로 실행
   runBatch().catch(e => {
     console.error('배치 오류:', e.message);
     state.running = false;
   });
 });
 
-// 중지
 app.post('/api/stop', (req, res) => {
   state.running = false;
   res.json({ ok: true });
@@ -173,7 +186,6 @@ app.post('/api/stop', (req, res) => {
 // --- 핵심 로직 ---
 
 async function runBatch() {
-  // setDownloadBehavior
   cdpSession = await page.context().newCDPSession(page);
   await cdpSession.send('Browser.setDownloadBehavior', {
     behavior: 'allow',
@@ -181,16 +193,25 @@ async function runBatch() {
     eventsEnabled: true,
   });
 
+  // GUID 기반 다운로드 추적
+  let lastDownloadGuid = null;
+  let lastSuggestedFilename = null;
   let downloadCompleted = false;
+
+  cdpSession.on('Browser.downloadWillBegin', (params) => {
+    lastDownloadGuid = params.guid;
+    lastSuggestedFilename = params.suggestedFilename;
+    downloadCompleted = false;
+  });
   cdpSession.on('Browser.downloadProgress', (params) => {
-    if (params.state === 'completed') downloadCompleted = true;
+    if (params.guid === lastDownloadGuid && params.state === 'completed') {
+      downloadCompleted = true;
+    }
   });
 
   // ezbaro 페이지 찾기
   const ctx = browser.contexts()[0];
   page = ctx.pages().find(p => /ezbaro/i.test(p.url())) || page;
-
-  const DOWNLOAD_FILENAME = null; // 서버가 주는 파일명 (동적 감지)
 
   for (let i = 0; i < state.tasks.length; i++) {
     if (!state.running) break;
@@ -198,10 +219,24 @@ async function runBatch() {
     state.results[i] = { status: '진행중' };
 
     const t = state.tasks[i];
-    const targetName = `${t.과제번호}_${t.연구수행기관}_${t.연구책임자}.xlsx`;
+    const targetName = sanitizeFilename(`${t.과제번호}_${t.연구수행기관}_${t.연구책임자}.xlsx`);
+
+    // UUID 방어: targetName 자체가 UUID 패턴이면 거부
+    const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+    if (uuidPattern.test(targetName)) {
+      state.results[i] = { status: '실패', reason: '파일명이 UUID 패턴' };
+      continue;
+    }
+
+    // 이미 존재하면 스킵
+    const targetPath = path.join(state.downloadDir, targetName);
+    if (fs.existsSync(targetPath)) {
+      state.results[i] = { status: '완료', reason: '이미 존재', name: targetName };
+      continue;
+    }
 
     try {
-      // cal00202이면 목록으로 복귀
+      // cal00202이면 목록 복귀
       if (await isOnCal00202()) {
         await goBackToCal00201();
         await sleep(1000);
@@ -215,7 +250,7 @@ async function runBatch() {
       const rows = await getSearchResults();
       const match = rows.find(r => r.기관명 === t.연구수행기관);
       if (!match) {
-        state.results[i] = { status: '실패', reason: '기관 매칭 실패' };
+        state.results[i] = { status: '실패', reason: `기관 매칭 실패 (검색결과 ${rows.length}건)` };
         continue;
       }
 
@@ -223,35 +258,53 @@ async function runBatch() {
       await enterOrg(match.row);
       await sleep(1000);
 
-      // 기존 다운로드 파일 삭제 (덮어쓰기 방지)
-      await deleteFileInDir(state.downloadDir, getDatedFilename());
+      // 기존 다운로드 파일 삭제
+      const datedFile = getDatedFilename();
+      const datedPath = path.join(state.downloadDir, datedFile);
+      try { fs.unlinkSync(datedPath); } catch {}
 
       // 엑셀 다운로드
+      lastDownloadGuid = null;
+      lastSuggestedFilename = null;
       downloadCompleted = false;
+
       await clickExcelDownload();
       await sleep(2000);
       await fillDownloadReason();
 
-      // 다운로드 대기
+      // 다운로드 완료 대기 (최대 30초)
       for (let w = 0; w < 60; w++) {
         if (downloadCompleted) break;
         await sleep(500);
       }
       await sleep(500);
 
-      // rename
-      const origFile = await findDownloadedFile(state.downloadDir);
-      if (origFile) {
-        await renameFile(state.downloadDir, origFile, targetName);
-        // UUID 방어 체크
-        const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
-        if (uuidPattern.test(targetName)) {
-          state.results[i] = { status: '실패', reason: 'UUID 파일명 감지' };
-        } else {
+      // rename — suggestedFilename 또는 dated 파일명으로 탐색
+      const origFile = lastSuggestedFilename || datedFile;
+      const origPath = path.join(state.downloadDir, origFile);
+
+      if (fs.existsSync(origPath)) {
+        try {
+          fs.renameSync(origPath, targetPath);
           state.results[i] = { status: '완료', name: targetName };
+        } catch (e) {
+          state.results[i] = { status: '실패', reason: `rename 실패: ${e.message}` };
+        }
+      } else if (downloadCompleted) {
+        // 이벤트는 왔지만 파일을 못 찾음 — 폴더에서 최신 파일 탐색
+        const found = findNewestXlsx(state.downloadDir);
+        if (found) {
+          try {
+            fs.renameSync(path.join(state.downloadDir, found), targetPath);
+            state.results[i] = { status: '완료', name: targetName };
+          } catch (e) {
+            state.results[i] = { status: '실패', reason: `rename 실패: ${e.message}` };
+          }
+        } else {
+          state.results[i] = { status: '실패', reason: '다운로드 완료됐으나 파일 없음' };
         }
       } else {
-        state.results[i] = { status: '실패', reason: '다운로드 파일 없음' };
+        state.results[i] = { status: '실패', reason: '다운로드 시간 초과' };
       }
     } catch (e) {
       state.results[i] = { status: '실패', reason: e.message };
@@ -294,10 +347,11 @@ async function goBackToCal00201() {
     if (ok) return;
     await sleep(500);
   }
+  throw new Error('cal00201 복귀 시간 초과');
 }
 
 async function searchTask(taskNo, year) {
-  await page.evaluate((opts) => {
+  const ok = await page.evaluate((opts) => {
     const { task, year } = opts;
     const frames = window._application?.gvWorkFrame?.frames;
     let form = null;
@@ -305,7 +359,7 @@ async function searchTask(taskNo, year) {
       const c = frames[i]?.form?.divWork?.form;
       if (c?.name === 'cal00201') { form = c; break; }
     }
-    if (!form) return;
+    if (!form) return false;
     const s = form.divSearch.form;
     try { s.chkOrdtmChckReprtCrtBjF.set_value('0'); } catch {}
     try { s.edtIeNm.set_value(''); s.edtIeNm.set_text(''); } catch {}
@@ -321,7 +375,9 @@ async function searchTask(taskNo, year) {
     s.edtNewTakN.set_value(task);
     s.edtNewTakN.set_text(task);
     form.divSearch_btnSearch_onclick(s.btnSearch, {});
-  }, { task: taskNo, year }).catch(() => {});
+    return true;
+  }, { task: taskNo, year }).catch(() => false);
+  if (!ok) throw new Error('cal00201 검색 폼 접근 실패');
 }
 
 async function getSearchResults() {
@@ -363,15 +419,18 @@ async function enterOrg(rowIdx) {
 }
 
 async function clickExcelDownload() {
-  await page.evaluate(() => {
+  const ok = await page.evaluate(() => {
     const frames = window._application?.gvWorkFrame?.frames;
     let form = null;
     for (let i = 0; i < frames.length; i++) {
       const c = frames[i]?.form?.divWork?.form;
       if (c?.name === 'cal00202') { form = c; break; }
     }
-    if (form) form.btnExcelDownload_onclick(form.btnExcelDownload, {});
-  }).catch(() => {});
+    if (!form) return false;
+    form.btnExcelDownload_onclick(form.btnExcelDownload, {});
+    return true;
+  }).catch(() => false);
+  if (!ok) throw new Error('엑셀다운로드 버튼 클릭 실패');
 }
 
 async function fillDownloadReason() {
@@ -396,38 +455,18 @@ function getDatedFilename() {
   return `${ymd}_calOrdtmChckExeExcelList.xlsx`;
 }
 
-async function findDownloadedFile(dir) {
-  const fs = require('fs');
+function findNewestXlsx(dir) {
   try {
-    const files = fs.readdirSync(dir).filter(f => f.endsWith('.xlsx'));
-    // 가장 최근 파일
-    if (files.length === 0) return null;
+    const files = fs.readdirSync(dir).filter(f => f.endsWith('.xlsx') && !f.startsWith('~'));
+    if (!files.length) return null;
     let newest = files[0];
     let newestTime = 0;
     for (const f of files) {
       const stat = fs.statSync(path.join(dir, f));
-      if (stat.mtimeMs > newestTime) {
-        newestTime = stat.mtimeMs;
-        newest = f;
-      }
+      if (stat.mtimeMs > newestTime) { newestTime = stat.mtimeMs; newest = f; }
     }
     return newest;
-  } catch {
-    return null;
-  }
-}
-
-async function deleteFileInDir(dir, name) {
-  const fs = require('fs');
-  const fp = path.join(dir, name);
-  try { fs.unlinkSync(fp); } catch {}
-}
-
-async function renameFile(dir, oldName, newName) {
-  const fs = require('fs');
-  const oldPath = path.join(dir, oldName);
-  const newPath = path.join(dir, newName);
-  try { fs.renameSync(oldPath, newPath); } catch {}
+  } catch { return null; }
 }
 
 function sleep(ms) {
@@ -435,7 +474,6 @@ function sleep(ms) {
 }
 
 function findChromePath() {
-  const fs = require('fs');
   const candidates = [
     'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
     'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',

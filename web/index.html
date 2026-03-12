@@ -234,14 +234,23 @@
       tbody.innerHTML = '';
       data.tasks.forEach((t, i) => {
         const tr = document.createElement('tr');
-        tr.innerHTML = `
-          <td>${i + 1}</td>
-          <td>${t.사업년도}</td>
-          <td>${t.과제번호}</td>
-          <td>${t.연구수행기관}</td>
-          <td>${t.연구책임자}</td>
-          <td><span class="badge badge-${badgeClass(t.status)}">${t.status}</span></td>
-        `;
+        const cells = [i + 1, t.사업년도, t.과제번호, t.연구수행기관, t.연구책임자];
+        cells.forEach(v => {
+          const td = document.createElement('td');
+          td.textContent = v;
+          tr.appendChild(td);
+        });
+        // 상태 배지
+        const tdStatus = document.createElement('td');
+        const badge = document.createElement('span');
+        badge.className = 'badge badge-' + badgeClass(t.status);
+        badge.textContent = t.status;
+        if (t.status === '실패' && t.reason) {
+          badge.title = t.reason;
+          badge.style.cursor = 'help';
+        }
+        tdStatus.appendChild(badge);
+        tr.appendChild(tdStatus);
         tbody.appendChild(tr);
       });
       document.getElementById('tableArea').style.display = 'block';
@@ -303,6 +312,10 @@
             const badge = rows[i].querySelector('.badge');
             badge.className = 'badge badge-' + badgeClass(t.status);
             badge.textContent = t.status;
+            if (t.status === '실패' && t.reason) {
+              badge.title = t.reason;
+              badge.style.cursor = 'help';
+            }
           }
         });
 
