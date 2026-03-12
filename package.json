@@ -1,6 +1,6 @@
 {
   "name": "kiwi",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "이지바로 집행내역 다운로드",
   "main": "electron/main.js",
   "scripts": {
@@ -21,7 +21,7 @@
     ],
     "win": {
       "target": "nsis",
-      "icon": null
+      "icon": "build/icon.ico"
     },
     "nsis": {
       "oneClick": false,
