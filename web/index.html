@@ -246,7 +246,11 @@
       try {
         const res = await fetch('/api/navigate', { method: 'POST' });
         const data = await res.json();
-        if (!data.ok) alert(data.message);
+        if (data.ok) {
+          alert('상시점검 관리 화면으로 이동 완료');
+        } else {
+          alert(data.message || data.error || '자동 이동 실패');
+        }
       } catch (e) {
         alert('자동 이동 실패: ' + e.message);
       }
