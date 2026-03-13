@@ -280,7 +280,25 @@ async function navigateToSangsijumgum() {
   // ezbaro 페이지로 재선택 (gaia 페이지가 선택되어 있을 수 있음)
   if (browser && browser.isConnected()) {
     const ctx = browser.contexts()[0];
-    const ezPage = ctx?.pages()?.find(p => /ezbaro/i.test(p.url()));
+    const allPages = ctx?.pages() || [];
+    let ezPage = allPages.find(p => /ezbaro/i.test(p.url()));
+
+    // ezbaro 탭이 없으면 gaia/현재 페이지에서 직접 ezbaro로 이동
+    if (!ezPage) {
+      const targetPage = allPages.find(p => /gaia/i.test(p.url())) || page;
+      if (targetPage) {
+        try {
+          await targetPage.goto('https://www.ezbaro.go.kr/rims/index.html', { waitUntil: 'domcontentloaded', timeout: 15000 });
+          // Nexacro 좌측 메뉴 프레임 로드 대기 (fnCalMenuMove 사용 가능해야 함)
+          await waitUntil(async () => {
+            return targetPage.evaluate(() => typeof window._application?.gvLeftFrame?.form?.fnCalMenuMove === 'function').catch(() => false);
+          }, { maxWait: 10000, interval: 500 });
+          ezPage = targetPage;
+          page = targetPage;
+        } catch {}
+      }
+    }
+
     if (ezPage && ezPage !== page) {
       page = ezPage;
       page.on('dialog', async d => { try { await d.accept(); } catch {} });
@@ -310,6 +328,17 @@ async function navigateToSangsijumgum() {
   }).catch(() => false);
 
   if (opened) {
+    // 먼저 frames가 존재하는지 빠르게 확인 (로그인 여부 판단)
+    await sleep(2000); // fnCalMenuMove 후 최소 대기
+    const framesCount = await page.evaluate(() =>
+      window._application?.gvWorkFrame?.frames?.length || 0
+    ).catch(() => 0);
+
+    if (framesCount === 0) {
+      // 로그인 안 된 상태 — ezbaro 진입까지만 성공
+      return 'need_login';
+    }
+
     // cal00201 폼 로드 대기
     try {
       await waitUntil(async () => {
@@ -322,7 +351,8 @@ async function navigateToSangsijumgum() {
         }).catch(() => false);
       }, { maxWait: 10000 });
       return true;
-    } catch {}
+    } catch (e) {
+    }
   }
 
   // 실패 시 false 반환 — UI에서 수동 안내
@@ -538,8 +568,14 @@ app.post('/api/retry-failed', async (req, res) => {
 app.post('/api/navigate', async (req, res) => {
   if (!browser || !browser.isConnected()) return res.status(400).json({ error: '브라우저 미연결' });
   try {
-    const ok = await navigateToSangsijumgum();
-    res.json({ ok, message: ok ? '상시점검 관리 화면으로 이동 완료' : '자동 이동 실패. 수동으로 정산 → 상시점검 → 상시점검 관리로 이동하세요.' });
+    const result = await navigateToSangsijumgum();
+    if (result === true) {
+      res.json({ ok: true, message: '상시점검 관리 화면으로 이동 완료' });
+    } else if (result === 'need_login') {
+      res.json({ ok: true, message: '이지바로 화면으로 이동 완료. 로그인 후 다시 자동 이동을 눌러주세요.' });
+    } else {
+      res.json({ ok: false, message: '자동 이동 실패. 수동으로 정산 → 상시점검 → 상시점검 관리로 이동하세요.' });
+    }
   } catch (e) {
     console.error('네비게이션 오류:', e.message);
     res.status(500).json({ ok: false, message: '자동 이동 오류: ' + e.message });
